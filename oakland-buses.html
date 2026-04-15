@@ -505,29 +505,67 @@ const ROUTES = [
   }
 ];
 
-const occupancyLevels = ['low','low','med','med','high'];
-const occupancyLabels = { low: 'Not crowded', med: 'Some seats', high: 'Standing room' };
+const API_TOKEN = '1D822695AF23FDEE3E27067B72F5DCFF';
+const MY_STOPS = ['55443', '58500', '55088'];
+const occupancyLabels = { EMPTY: 'Empty', HALF_EMPTY: 'Some seats', FULL: 'Standing room', '': 'Unknown' };
+const occupancyClass = { EMPTY: 'low', HALF_EMPTY: 'med', FULL: 'high', '': 'med' };
 
-function randArrival() {
-  const first = Math.floor(Math.random() * 6);
-  const second = first + 3 + Math.floor(Math.random() * 10);
-  const third = second + 5 + Math.floor(Math.random() * 15);
-  return [first, second, third];
-}
+let arrivals = {};
+let activeFilter = 'mine';
+let loading = true;
 
-function getArrivals() {
-  const data = {};
-  ROUTES.forEach(r => {
-    data[r.id] = {
-      times: randArrival(),
-      occupancy: occupancyLevels[Math.floor(Math.random() * occupancyLevels.length)]
+async function fetchArrivals() {
+  const allPredictions = [];
+  for (const stopId of MY_STOPS) {
+    try {
+      const res = await fetch(
+        `https://api.actransit.org/transit/actrealtime/prediction?stpid=${stopId}&token=${API_TOKEN}`
+      );
+      const data = await res.json();
+      const preds = data['bustime-response']?.prd || [];
+      allPredictions.push(...preds);
+    } catch (e) {
+      console.error(`Failed to fetch stop ${stopId}:`, e);
+    }
+  }
+
+  // Group predictions by route
+  const grouped = {};
+  allPredictions.forEach(p => {
+    const rt = p.rt;
+    if (!grouped[rt]) grouped[rt] = [];
+    grouped[rt].push({
+      minutes: p.prdctdn === 'DUE' ? 0 : parseInt(p.prdctdn),
+      destination: p.des,
+      direction: p.rtdir,
+      stopName: p.stpnm,
+      stopId: p.stpid,
+      vehicleId: p.vid,
+      delayed: p.dly,
+      load: p.psgld || '',
+      scheduled: p.schdtm,
+      predicted: p.prdtm
+    });
+  });
+
+  // Build arrivals keyed by route id
+  const newArrivals = {};
+  Object.entries(grouped).forEach(([rt, preds]) => {
+    preds.sort((a, b) => a.minutes - b.minutes);
+    newArrivals[rt] = {
+      times: preds.map(p => p.minutes),
+      occupancy: preds[0]?.load || '',
+      direction: preds[0]?.direction || '',
+      destination: preds[0]?.destination || '',
+      stopName: preds[0]?.stopName || '',
+      stopId: preds[0]?.stopId || '',
+      predictions: preds
     };
   });
-  return data;
-}
 
-let arrivals = getArrivals();
-let activeFilter = 'mine';
+  arrivals = newArrivals;
+  loading = false;
+}
 
 function arrivalPill(min) {
   if (min <= 1) return `<span class="arrival-pill arrival-now">NOW</span>`;
@@ -537,20 +575,52 @@ function arrivalPill(min) {
 
 function renderBuses() {
   const list = document.getElementById('busList');
-  const filtered = activeFilter === 'mine'
-    ? ROUTES.filter(r => MY_BUSES.includes(r.id))
-    : activeFilter === 'all'
-      ? ROUTES
-      : ROUTES.filter(r => r.type === activeFilter);
 
-  if (!filtered.length) {
+  if (loading) {
+    list.innerHTML = `<div class="empty-state"><p>Loading real-time arrivals...</p></div>`;
+    return;
+  }
+
+  let filtered;
+  if (activeFilter === 'mine') {
+    filtered = ROUTES.filter(r => MY_BUSES.includes(r.id));
+  } else if (activeFilter === 'all') {
+    filtered = ROUTES;
+  } else {
+    filtered = ROUTES.filter(r => r.type === activeFilter);
+  }
+
+  // Only show routes that have live predictions (for My Buses), keep all for other filters
+  const withData = filtered.map(route => {
+    const a = arrivals[route.id];
+    return { route, a };
+  });
+
+  if (!withData.length) {
     list.innerHTML = `<div class="empty-state"><p>No buses match this filter</p></div>`;
     return;
   }
 
-  list.innerHTML = filtered.map(route => {
-    const a = arrivals[route.id];
+  list.innerHTML = withData.map(({ route, a }) => {
+    if (!a || !a.times.length) {
+      return `
+        <div class="bus-card${route.priority ? ' priority' : ''}">
+          <div class="bus-card-top">
+            <div class="bus-route-info">
+              <div class="route-badge" style="background:${route.color}">${route.name}</div>
+              <div>
+                <div class="route-name">${route.priority ? '&#9733; ' : ''}${route.destination}</div>
+                <div class="route-dest">No buses predicted right now</div>
+              </div>
+            </div>
+          </div>
+        </div>`;
+    }
     const occ = a.occupancy;
+    const occClass = occupancyClass[occ] || 'med';
+    const occLabel = occupancyLabels[occ] || 'Unknown';
+    const liveDir = a.direction || route.headsign;
+    const liveStop = a.stopName || route.nearStop;
     return `
       <div class="bus-card${route.priority ? ' priority' : ''}" onclick="showDetail('${route.id}')">
         <div class="bus-card-top">
@@ -558,13 +628,13 @@ function renderBuses() {
             <div class="route-badge" style="background:${route.color}">${route.name}</div>
             <div>
               <div class="route-name">${route.priority ? '&#9733; ' : ''}${route.destination}</div>
-              <div class="route-dest">${route.headsign}</div>
+              <div class="route-dest">${liveDir}</div>
             </div>
           </div>
         </div>
         <div style="display:flex;align-items:center;justify-content:space-between">
           <div class="arrivals">
-            ${a.times.map(t => arrivalPill(t)).join('')}
+            ${a.times.slice(0, 3).map(t => arrivalPill(t)).join('')}
           </div>
         </div>
         <div class="bus-card-bottom">
@@ -572,11 +642,11 @@ function renderBuses() {
             <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
               <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/>
             </svg>
-            ${route.nearStop}
+            ${liveStop}
           </div>
           <div class="occupancy">
-            <span class="occ-dot occ-${occ}"></span>
-            ${occupancyLabels[occ]}
+            <span class="occ-dot occ-${occClass}"></span>
+            ${occLabel}
           </div>
         </div>
       </div>`;
@@ -589,33 +659,37 @@ function renderBuses() {
 function showDetail(id) {
   const route = ROUTES.find(r => r.id === id);
   const a = arrivals[id];
-  const activeIdx = 1 + Math.floor(Math.random() * (route.stops.length - 2));
+  if (!a) return;
 
   document.getElementById('detailContent').innerHTML = `
     <div class="detail-header">
       <div class="route-badge" style="background:${route.color};width:52px;height:44px;font-size:19px">${route.name}</div>
       <div class="detail-title">
         <h2>${route.destination}</h2>
-        <p>${route.headsign}</p>
+        <p>${a.direction || route.headsign}</p>
       </div>
     </div>
-    <p style="font-size:13px;color:var(--muted);margin-bottom:4px">Next arrivals at ${route.nearStop}</p>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:4px">Next arrivals at ${a.stopName}</p>
     <div class="arrivals" style="margin-bottom:20px">
-      ${a.times.map(t => arrivalPill(t)).join('')}
+      ${a.times.slice(0, 3).map(t => arrivalPill(t)).join('')}
     </div>
-    <p style="font-size:13px;color:var(--muted);margin-bottom:12px">Route stops</p>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:12px">Upcoming buses</p>
     <ul class="stop-list">
-      ${route.stops.map((s, i) => `
+      ${a.predictions.map((p, i) => {
+        const load = occupancyLabels[p.load] || '';
+        const delayed = p.delayed ? ' (delayed)' : '';
+        return `
         <li class="stop-item">
           <div class="stop-dot-col">
-            <div class="stop-dot ${i === activeIdx ? 'active' : ''}"></div>
-            ${i < route.stops.length - 1 ? '<div class="stop-line"></div>' : ''}
+            <div class="stop-dot ${i === 0 ? 'active' : ''}"></div>
+            ${i < a.predictions.length - 1 ? '<div class="stop-line"></div>' : ''}
           </div>
           <div class="stop-info">
-            <h4>${s}</h4>
-            ${i === activeIdx ? '<p style="color:var(--accent)">Bus is here</p>' : `<p>${i < activeIdx ? 'Passed' : `~${(i - activeIdx) * 3 + a.times[0]} min`}</p>`}
+            <h4>${p.minutes === 0 ? 'DUE NOW' : p.minutes + ' min'}${delayed}</h4>
+            <p>Vehicle #${p.vehicleId}${load ? ' · ' + load : ''}</p>
           </div>
-        </li>`).join('')}
+        </li>`;
+      }).join('')}
     </ul>`;
 
   document.getElementById('detailModal').classList.add('open');
@@ -625,14 +699,12 @@ function closeDetail() {
   document.getElementById('detailModal').classList.remove('open');
 }
 
-function refreshData() {
+async function refreshData() {
   const btn = document.querySelector('.refresh-btn');
   btn.classList.add('spinning');
-  setTimeout(() => {
-    arrivals = getArrivals();
-    renderBuses();
-    btn.classList.remove('spinning');
-  }, 500);
+  await fetchArrivals();
+  renderBuses();
+  btn.classList.remove('spinning');
 }
 
 // Filters
@@ -646,20 +718,13 @@ document.querySelectorAll('.filter-chip').forEach(chip => {
 });
 
 // Auto-refresh every 30s
-setInterval(() => {
-  arrivals = getArrivals();
+setInterval(async () => {
+  await fetchArrivals();
   renderBuses();
 }, 30000);
 
-// Countdown: decrement times every 60s
-setInterval(() => {
-  Object.values(arrivals).forEach(a => {
-    a.times = a.times.map(t => Math.max(0, t - 1));
-  });
-  renderBuses();
-}, 60000);
-
-renderBuses();
+// Initial load
+fetchArrivals().then(() => renderBuses());
 </script>
 </body>
 </html>
