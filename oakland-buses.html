@@ -728,6 +728,14 @@ setInterval(async () => {
   renderBuses();
 }, 30000);
 
+// Refresh when switching back to the tab
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible') {
+    await fetchArrivals();
+    renderBuses();
+  }
+});
+
 // Initial load
 fetchArrivals().then(() => renderBuses());
 </script>
