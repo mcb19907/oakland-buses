@@ -358,6 +358,26 @@
 
     .stop-info h4 { font-size: 14px; font-weight: 500; }
     .stop-info p { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+    .flip-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      padding: 10px 14px;
+      margin-bottom: 16px;
+      background: rgba(79, 140, 255, 0.1);
+      border: 1px solid rgba(79, 140, 255, 0.25);
+      border-radius: 10px;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .flip-btn:active { background: rgba(79, 140, 255, 0.2); transform: scale(0.98); }
+    .flip-btn svg { flex-shrink: 0; }
+    .flip-btn.loading { opacity: 0.5; pointer-events: none; }
   </style>
 </head>
 <body>
@@ -513,6 +533,11 @@ const ROUTES = [
 
 const API_TOKEN = '1D822695AF23FDEE3E27067B72F5DCFF';
 const MY_STOPS = ['55443', '58500', '55088'];
+const STOP_COORDS = {
+  '55443': { lat: 37.804607, lon: -122.229771 },
+  '58500': { lat: 37.806100, lon: -122.232300 },
+  '55088': { lat: 37.805800, lon: -122.233100 }
+};
 const occupancyLabels = { EMPTY: 'Empty', HALF_EMPTY: 'Some seats', FULL: 'Standing room', '': 'Unknown' };
 const occupancyClass = { EMPTY: 'low', HALF_EMPTY: 'med', FULL: 'high', '': 'med' };
 
@@ -714,7 +739,7 @@ function renderBuses() {
       const occLabel = occupancyLabels[occ] || 'Unknown';
       const distLabel = a.distFt < 528 ? `${Math.round(a.distFt)}ft` : `${(a.distFt / 5280).toFixed(1)}mi`;
       return `
-        <div class="bus-card">
+        <div class="bus-card" onclick="showNearbyDetail('${rt}')"
           <div class="bus-card-top">
             <div class="bus-route-info">
               <div class="route-badge" style="background:${getRouteColor(rt)}">${rt}</div>
@@ -828,33 +853,36 @@ function renderBuses() {
     `Updated ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
 }
 
-function showDetail(id) {
-  const route = ROUTES.find(r => r.id === id);
-  const a = arrivals[id];
-  if (!a) return;
+function renderDetailContent(routeId, routeColor, routeName, direction, stopName, stopId, predictions) {
+  const flipIcon = `<svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"/></svg>`;
+  const times = predictions.map(p => p.minutes);
 
-  document.getElementById('detailContent').innerHTML = `
+  return `
     <div class="detail-header">
-      <div class="route-badge" style="background:${route.color};width:52px;height:44px;font-size:19px">${route.name}</div>
+      <div class="route-badge" style="background:${routeColor};width:52px;height:44px;font-size:19px">${routeName}</div>
       <div class="detail-title">
-        <h2>${route.destination}</h2>
-        <p>${a.direction || route.headsign}</p>
+        <h2>${routeName}</h2>
+        <p>${direction}</p>
       </div>
     </div>
-    <p style="font-size:13px;color:var(--muted);margin-bottom:4px">Next arrivals at ${a.stopName}</p>
+    <button class="flip-btn" id="flipBtn" onclick="flipDirection('${routeId}', '${stopId}')">
+      ${flipIcon}
+      <span>Show other direction</span>
+    </button>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:4px">Next arrivals at ${stopName}</p>
     <div class="arrivals" style="margin-bottom:20px">
-      ${a.times.slice(0, 3).map(t => arrivalPill(t)).join('')}
+      ${times.slice(0, 3).map(t => arrivalPill(t)).join('')}
     </div>
     <p style="font-size:13px;color:var(--muted);margin-bottom:12px">Upcoming buses</p>
     <ul class="stop-list">
-      ${a.predictions.map((p, i) => {
+      ${predictions.map((p, i) => {
         const load = occupancyLabels[p.load] || '';
         const delayed = p.delayed ? ' (delayed)' : '';
         return `
         <li class="stop-item">
           <div class="stop-dot-col">
             <div class="stop-dot ${i === 0 ? 'active' : ''}"></div>
-            ${i < a.predictions.length - 1 ? '<div class="stop-line"></div>' : ''}
+            ${i < predictions.length - 1 ? '<div class="stop-line"></div>' : ''}
           </div>
           <div class="stop-info">
             <h4>${p.minutes === 0 ? 'DUE NOW' : p.minutes + ' min'}${delayed}</h4>
@@ -863,8 +891,134 @@ function showDetail(id) {
         </li>`;
       }).join('')}
     </ul>`;
+}
 
+function showDetail(id) {
+  const route = ROUTES.find(r => r.id === id);
+  const a = arrivals[id];
+  if (!a) return;
+
+  document.getElementById('detailContent').innerHTML = renderDetailContent(
+    id, route.color, route.name,
+    a.direction || route.headsign,
+    a.stopName, a.stopId,
+    a.predictions
+  );
   document.getElementById('detailModal').classList.add('open');
+}
+
+function showNearbyDetail(rt) {
+  const a = nearbyArrivals[rt];
+  if (!a) return;
+  const color = getRouteColor(rt);
+  const stopId = a.predictions[0]?.stopId || '';
+
+  document.getElementById('detailContent').innerHTML = renderDetailContent(
+    rt, color, rt,
+    a.direction,
+    a.stopName, stopId,
+    a.predictions
+  );
+  document.getElementById('detailModal').classList.add('open');
+}
+
+async function flipDirection(routeId, currentStopId) {
+  const btn = document.getElementById('flipBtn');
+  btn.classList.add('loading');
+  btn.querySelector('span').textContent = 'Finding other direction...';
+
+  // Get coordinates for the current stop
+  let lat, lon;
+  const known = STOP_COORDS[currentStopId];
+  if (known) {
+    lat = known.lat;
+    lon = known.lon;
+  } else {
+    // Look up stop coords from API
+    try {
+      const res = await fetch(`https://api.actransit.org/transit/stops/${currentStopId}?token=${API_TOKEN}`);
+      const stop = await res.json();
+      lat = stop.Latitude;
+      lon = stop.Longitude;
+    } catch (e) {
+      btn.classList.remove('loading');
+      btn.querySelector('span').textContent = 'Could not find other direction';
+      return;
+    }
+  }
+
+  try {
+    // Find nearby stops for this route (1500ft to catch the opposite side)
+    const stopsRes = await fetch(
+      `https://api.actransit.org/transit/stops/${lat}/${lon}/1500?token=${API_TOKEN}`
+    );
+    const nearbyStops = await stopsRes.json();
+
+    // Try each nearby stop (excluding current) for predictions on this route in the other direction
+    let flippedPreds = null;
+    let flippedStop = null;
+
+    for (const stop of nearbyStops) {
+      if (String(stop.StopId) === String(currentStopId)) continue;
+
+      try {
+        const predRes = await fetch(
+          `https://api.actransit.org/transit/actrealtime/prediction?stpid=${stop.StopId}&rt=${routeId}&token=${API_TOKEN}`
+        );
+        const predData = await predRes.json();
+        const preds = predData['bustime-response']?.prd || [];
+
+        if (preds.length > 0) {
+          // Check if this is a different direction than what we currently show
+          const currentDir = arrivals[routeId]?.direction || '';
+          const newDir = preds[0].rtdir || '';
+          if (newDir !== currentDir || !currentDir) {
+            flippedPreds = preds;
+            flippedStop = stop;
+            break;
+          }
+        }
+      } catch (e) { /* try next stop */ }
+    }
+
+    if (!flippedPreds) {
+      btn.classList.remove('loading');
+      btn.querySelector('span').textContent = 'No buses in other direction right now';
+      setTimeout(() => {
+        btn.querySelector('span').textContent = 'Show other direction';
+        btn.classList.remove('loading');
+      }, 3000);
+      return;
+    }
+
+    // Build predictions array
+    const predictions = flippedPreds.map(p => ({
+      minutes: p.prdctdn === 'DUE' ? 0 : parseInt(p.prdctdn),
+      destination: p.des,
+      direction: p.rtdir,
+      stopName: p.stpnm,
+      stopId: String(flippedStop.StopId),
+      vehicleId: p.vid,
+      delayed: p.dly,
+      load: p.psgld || ''
+    }));
+    predictions.sort((a, b) => a.minutes - b.minutes);
+
+    const route = ROUTES.find(r => r.id === routeId);
+    const color = route ? route.color : getRouteColor(routeId);
+
+    document.getElementById('detailContent').innerHTML = renderDetailContent(
+      routeId, color, routeId,
+      predictions[0].direction,
+      predictions[0].stopName,
+      predictions[0].stopId,
+      predictions
+    );
+
+  } catch (e) {
+    btn.classList.remove('loading');
+    btn.querySelector('span').textContent = 'Error loading other direction';
+  }
 }
 
 function closeDetail() {
