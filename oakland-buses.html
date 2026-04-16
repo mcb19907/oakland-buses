@@ -385,6 +385,7 @@
   </div>
   <div class="filter-row">
     <button class="filter-chip active" data-filter="mine">My Buses</button>
+    <button class="filter-chip" data-filter="nearby">Near Me</button>
     <button class="filter-chip" data-filter="all">All</button>
     <button class="filter-chip" data-filter="local">Local</button>
     <button class="filter-chip" data-filter="transbay">Transbay</button>
@@ -572,6 +573,115 @@ async function fetchArrivals() {
   loading = false;
 }
 
+// ── NEAR ME ──
+let nearbyArrivals = {};
+let nearbyLoading = false;
+let nearbyError = '';
+const ROUTE_COLORS = {
+  'V':'#8b5cf6','18':'#f59e0b','688':'#06b6d4','NL':'#6366f1','NX':'#f43f5e',
+  '57':'#10b981','1':'#3b82f6','1R':'#ef4444','6':'#06b6d4','12':'#06b6d4',
+  '33':'#ec4899','51A':'#d946ef','72':'#14b8a6','72R':'#ef4444','51B':'#d946ef',
+  'NX1':'#d946ef','NX2':'#d946ef','NX3':'#d946ef','NXC':'#d946ef'
+};
+
+function getRouteColor(rt) {
+  return ROUTE_COLORS[rt] || '#' + ((parseInt(rt, 36) * 123456) % 0xFFFFFF).toString(16).padStart(6, '0');
+}
+
+async function fetchNearby() {
+  nearbyLoading = true;
+  nearbyError = '';
+  nearbyArrivals = {};
+  renderBuses();
+
+  let lat, lon;
+  try {
+    const pos = await new Promise((resolve, reject) =>
+      navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 10000 })
+    );
+    lat = pos.coords.latitude;
+    lon = pos.coords.longitude;
+  } catch (e) {
+    nearbyLoading = false;
+    nearbyError = e.code === 1 ? 'Location access denied — check your browser settings' : 'Could not get your location';
+    renderBuses();
+    return;
+  }
+
+  try {
+    // Get nearby stops within quarter mile (1320 ft)
+    const stopsRes = await fetch(
+      `https://api.actransit.org/transit/stops/${lat}/${lon}/1320?token=${API_TOKEN}`
+    );
+    const stops = await stopsRes.json();
+
+    if (!stops.length) {
+      nearbyLoading = false;
+      nearbyError = 'No AC Transit stops within a quarter mile';
+      renderBuses();
+      return;
+    }
+
+    // Fetch predictions for each nearby stop (max 8 to keep it fast)
+    const allPreds = [];
+    const stopDistances = {};
+    for (const stop of stops.slice(0, 8)) {
+      // Calculate rough distance in feet for display
+      const dLat = (stop.Latitude - lat) * 364000;
+      const dLon = (stop.Longitude - lon) * 288200;
+      const distFt = Math.round(Math.sqrt(dLat * dLat + dLon * dLon));
+      stopDistances[stop.StopId] = distFt;
+
+      try {
+        const res = await fetch(
+          `https://api.actransit.org/transit/actrealtime/prediction?stpid=${stop.StopId}&token=${API_TOKEN}`
+        );
+        const data = await res.json();
+        const preds = data['bustime-response']?.prd || [];
+        allPreds.push(...preds);
+      } catch (e) { /* skip failed stops */ }
+    }
+
+    // Group by route
+    const grouped = {};
+    allPreds.forEach(p => {
+      const rt = p.rt;
+      if (!grouped[rt]) grouped[rt] = [];
+      grouped[rt].push({
+        minutes: p.prdctdn === 'DUE' ? 0 : parseInt(p.prdctdn),
+        destination: p.des,
+        direction: p.rtdir,
+        stopName: p.stpnm,
+        stopId: p.stpid,
+        vehicleId: p.vid,
+        delayed: p.dly,
+        load: p.psgld || '',
+        distFt: stopDistances[parseInt(p.stpid)] || 0
+      });
+    });
+
+    const result = {};
+    Object.entries(grouped).forEach(([rt, preds]) => {
+      preds.sort((a, b) => a.minutes - b.minutes);
+      result[rt] = {
+        times: preds.map(p => p.minutes),
+        occupancy: preds[0]?.load || '',
+        direction: preds[0]?.direction || '',
+        stopName: preds[0]?.stopName || '',
+        distFt: preds[0]?.distFt || 0,
+        predictions: preds
+      };
+    });
+
+    nearbyArrivals = result;
+  } catch (e) {
+    nearbyError = 'Failed to load nearby buses';
+  }
+
+  nearbyLoading = false;
+  renderBuses();
+}
+
 function arrivalPill(min) {
   if (min <= 1) return `<span class="arrival-pill arrival-now">NOW</span>`;
   if (min <= 5) return `<span class="arrival-pill arrival-soon">${min}m</span>`;
@@ -580,6 +690,63 @@ function arrivalPill(min) {
 
 function renderBuses() {
   const list = document.getElementById('busList');
+
+  if (activeFilter === 'nearby') {
+    if (nearbyLoading) {
+      list.innerHTML = `<div class="empty-state"><p>📍 Finding nearby buses...</p></div>`;
+      return;
+    }
+    if (nearbyError) {
+      list.innerHTML = `<div class="empty-state"><p>${nearbyError}</p></div>`;
+      return;
+    }
+    const routes = Object.keys(nearbyArrivals);
+    if (!routes.length) {
+      list.innerHTML = `<div class="empty-state"><p>No nearby buses right now</p></div>`;
+      return;
+    }
+    // Sort by soonest arrival
+    routes.sort((a, b) => nearbyArrivals[a].times[0] - nearbyArrivals[b].times[0]);
+    list.innerHTML = routes.map(rt => {
+      const a = nearbyArrivals[rt];
+      const occ = a.occupancy;
+      const occClass = occupancyClass[occ] || 'med';
+      const occLabel = occupancyLabels[occ] || 'Unknown';
+      const distLabel = a.distFt < 528 ? `${Math.round(a.distFt)}ft` : `${(a.distFt / 5280).toFixed(1)}mi`;
+      return `
+        <div class="bus-card">
+          <div class="bus-card-top">
+            <div class="bus-route-info">
+              <div class="route-badge" style="background:${getRouteColor(rt)}">${rt}</div>
+              <div>
+                <div class="route-name">${a.direction}</div>
+                <div class="route-dest">${a.stopName}</div>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <div class="arrivals">
+              ${a.times.slice(0, 3).map(t => arrivalPill(t)).join('')}
+            </div>
+          </div>
+          <div class="bus-card-bottom">
+            <div class="stop-name">
+              <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/>
+              </svg>
+              ${distLabel} away
+            </div>
+            <div class="occupancy">
+              <span class="occ-dot occ-${occClass}"></span>
+              ${occLabel}
+            </div>
+          </div>
+        </div>`;
+    }).join('');
+    document.getElementById('lastUpdated').textContent =
+      `Updated ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+    return;
+  }
 
   if (loading) {
     list.innerHTML = `<div class="empty-state"><p>Loading real-time arrivals...</p></div>`;
@@ -707,8 +874,12 @@ function closeDetail() {
 async function refreshData() {
   const btn = document.querySelector('.refresh-btn');
   btn.classList.add('spinning');
-  await fetchArrivals();
-  renderBuses();
+  if (activeFilter === 'nearby') {
+    await fetchNearby();
+  } else {
+    await fetchArrivals();
+    renderBuses();
+  }
   btn.classList.remove('spinning');
 }
 
@@ -718,21 +889,33 @@ document.querySelectorAll('.filter-chip').forEach(chip => {
     document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
     chip.classList.add('active');
     activeFilter = chip.dataset.filter;
-    renderBuses();
+    if (activeFilter === 'nearby') {
+      fetchNearby();
+    } else {
+      renderBuses();
+    }
   });
 });
 
 // Auto-refresh every 30s
 setInterval(async () => {
-  await fetchArrivals();
-  renderBuses();
+  if (activeFilter === 'nearby') {
+    await fetchNearby();
+  } else {
+    await fetchArrivals();
+    renderBuses();
+  }
 }, 30000);
 
 // Refresh when switching back to the tab
 document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState === 'visible') {
-    await fetchArrivals();
-    renderBuses();
+    if (activeFilter === 'nearby') {
+      await fetchNearby();
+    } else {
+      await fetchArrivals();
+      renderBuses();
+    }
   }
 });
 
